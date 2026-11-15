@@ -1,0 +1,416 @@
+---
+title: "Seasonal Patterns and Cancellation Analysis in Hotel Booking Data"
+author: "Azizov Azer"
+date: "`r format(Sys.Date(), '%d %b %Y')`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+**Dataset:** Hotel Booking Demand (Kaggle, jessemostipak), `hotel_bookings.csv`.
+**Məqsəd:** Pivot cədvəllər və zaman üzrə aqreqasiya ilə otel rezervasiya tələbatını (ay × otel tipi) və ləğv səbəblərini analiz etmək.
+**Alət:** Analiz R dilində (tidyverse, lubridate, scales, ggplot2) icra olunub.
+
+## Setup və datanın yüklənməsi
+
+```{r setup}
+# Bütün chunk-lar üçün ümumi parametrlər
+knitr::opts_chunk$set(error = FALSE, message = FALSE, warning = FALSE,
+                      echo = TRUE, include = TRUE)
+
+library(tidyverse)
+library(lubridate)
+library(scales)
+
+# agent, company və country sütunlarında boşluqlar "NULL" yazısı kimi saxlanılıb.
+# Ona görə na = c("", "NA", "NULL") veririk, agent/company-ni isə rəqəm kimi oxuyuruq.
+df <- read_csv("hotel_bookings.csv",
+               na = c("", "NA", "NULL"),
+               col_types = cols(agent = col_double(),
+                                company = col_double(),
+                                country = col_character()))
+
+dim(df)  # sətir və sütun sayı
+```
+
+Dataset 119,390 sətir və 32 sütundan ibarətdir. Boşluqlar `"NULL"` yazısı kimi olduğu üçün onları oxuma zamanı həqiqi `NA`-ya çevirdim.
+
+## Çatışmayan dəyərləri yoxlamaq
+
+```{r missing-check}
+# Hər sütunda neçə NA var (yalnız NA olanları göstəririk)
+colSums(is.na(df)) %>%
+  sort(decreasing = TRUE) %>%
+  .[. > 0]
+```
+
+Çatışmayan dəyərlər dörd sütunda var: `company` (112,593), `agent` (16,340), `country` (488) və `children` (4). `company`-nin təxminən 94%-i boşdur, yəni əksər rezervasiyalarda şirkət göstərilməyib.
+
+## Çatışmayan dəyərləri doldurmaq
+
+```{r fill-missing}
+df <- df %>%
+  mutate(
+    country  = replace_na(country, "Unknown"),  # tapşırığa uyğun
+    agent    = replace_na(agent, 0),            # tapşırığa uyğun
+    company  = replace_na(company, 0),          # tapşırığa uyğun
+    children = replace_na(children, 0)          # 4 NA, tapşırıqda yoxdur, 0 ilə dolduruldu
+  )
+
+# Yoxlama: NA qalmamalıdır
+sum(is.na(df))
+```
+
+`country` boşluqları "Unknown", `agent` və `company` boşluqları 0 ilə dolduruldu, `children`-dəki 4 boşluq da 0 oldu. Yoxlamada NA sayı 0-dır, yəni data analizə hazırdır.
+
+## arrival_date sütununu yaratmaq
+
+```{r arrival-date}
+# Ay adlarının təqvim sırası
+month_levels <- c("January", "February", "March", "April", "May", "June",
+                  "July", "August", "September", "October", "November", "December")
+
+df <- df %>%
+  mutate(
+    # Ay adını rəqəmə çeviririk (January -> 1, ..., December -> 12)
+    arrival_month_num = match(arrival_date_month, month_levels),
+
+    # İl, ay və günü birləşdirib həqiqi tarix yaradırıq
+    arrival_date = make_date(arrival_date_year,
+                             arrival_month_num,
+                             arrival_date_day_of_month),
+
+    # Ay adını təqvim sırasında factor edirik (pivot və qrafiklər üçün)
+    arrival_date_month = factor(arrival_date_month, levels = month_levels)
+  )
+
+# Yoxlama
+sum(is.na(df$arrival_date))   # 0 olmalıdır
+range(df$arrival_date)        # tarix aralığı
+```
+
+Üç sütun birləşdirilərək `arrival_date` yarandı və heç bir boş tarix qalmadı. Data 2015-07-01 ilə 2017-08-31 arasını əhatə edir.
+
+## Pivot cədvəl (ay × hotel) və heatmap
+
+```{r pivot-heatmap}
+# Hər ay və hotel üçün rezervasiya sayı
+booking_counts <- df %>%
+  count(arrival_date_month, hotel)
+
+# Pivot cədvəl: sətir = ay, sütun = hotel, dəyər = rezervasiya sayı
+pivot_bookings <- booking_counts %>%
+  pivot_wider(names_from = hotel, values_from = n, values_fill = 0) %>%
+  arrange(arrival_date_month)
+
+pivot_bookings
+colSums(pivot_bookings[, c("City Hotel", "Resort Hotel")])  # cəmlər
+
+# Heatmap
+p_heat <- ggplot(booking_counts, aes(x = hotel, y = arrival_date_month, fill = n)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = comma(n)), size = 3.5) +
+  scale_y_discrete(limits = rev(month_levels)) +   # Yanvar yuxarıda olsun
+  scale_fill_gradient(low = "#fff5eb", high = "#d94801", labels = comma) +
+  labs(title = "Booking Count by Month and Hotel Type",
+       x = "Hotel", y = "Arrival Month", fill = "Bookings") +
+  theme_minimal()
+
+p_heat
+ggsave("heatmap_month_hotel.png", p_heat, width = 7, height = 6, dpi = 150)
+```
+
+City Hotel (79,330) hər ay Resort Hotel-dən (40,060) çox rezervasiya alır, Resort heç bir ayda City-ni üstələmir. Xam saylarda ən yüksək ay Avqustdur (8,983 + 4,894), amma bu nəticə növbəti hissədə il sayına görə dəqiqləşdirilir.
+
+## Normallaşdırma: il sayı fərqini nəzərə almaq
+
+```{r normalization}
+# 1) Hər ay neçə il üzrə data var?
+df %>%
+  distinct(arrival_date_year, arrival_date_month) %>%
+  count(arrival_date_month, name = "n_years") %>%
+  arrange(arrival_date_month)
+
+# 2) İl başına orta rezervasiya sayı (ay × hotel)
+monthly_avg <- df %>%
+  count(arrival_date_year, arrival_date_month, hotel) %>%
+  group_by(arrival_date_month, hotel) %>%
+  summarise(avg_bookings = round(mean(n)), n_years = n(), .groups = "drop")
+
+# 3) Normallaşdırılmış heatmap
+p_heat_avg <- ggplot(monthly_avg, aes(x = hotel, y = arrival_date_month,
+                                      fill = avg_bookings)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = comma(avg_bookings)), size = 3.5) +
+  scale_y_discrete(limits = rev(month_levels)) +
+  scale_fill_gradient(low = "#fff5eb", high = "#d94801", labels = comma) +
+  labs(title = "Average Bookings per Year by Month and Hotel Type",
+       subtitle = "Normalized: July and August have 3 years of data, other months 2",
+       x = "Hotel", y = "Arrival Month", fill = "Avg bookings") +
+  theme_minimal()
+
+p_heat_avg
+ggsave("heatmap_month_hotel_normalized.png", p_heat_avg, width = 7, height = 6, dpi = 150)
+```
+
+İyul və Avqust datada 3 ildə, digər aylar 2 ildə olduğu üçün xam say bu iki ayı süni şəkildə şişirir. İl başına ortalamada ən yüksək ay May-dır, ən aşağısı Yanvardır; Resort Hotel-də Aprel-Oktyabr arası həcm demək olar sabitdir (təxminən 1,500-1,800).
+
+## Aylıq ləğv nisbəti (hotel üzrə)
+
+```{r cancel-monthly}
+# 1) Hotel üzrə ümumi ləğv nisbəti
+df %>%
+  group_by(hotel) %>%
+  summarise(bookings = n(),
+            cancel_rate = mean(is_canceled))
+
+# 2) Aylıq ləğv nisbəti
+cancel_monthly <- df %>%
+  group_by(arrival_date_month, hotel) %>%
+  summarise(bookings = n(),
+            cancelled = sum(is_canceled),
+            cancel_rate = mean(is_canceled),
+            .groups = "drop")
+
+# Oxumaq üçün geniş cədvəl (faizlə)
+cancel_monthly %>%
+  select(arrival_date_month, hotel, cancel_rate) %>%
+  mutate(cancel_rate = round(cancel_rate * 100, 1)) %>%
+  pivot_wider(names_from = hotel, values_from = cancel_rate)
+
+# 3) Xətt qrafiki: iki hotel iki xətt
+p_cancel <- ggplot(cancel_monthly,
+                   aes(x = arrival_date_month, y = cancel_rate,
+                       color = hotel, group = hotel)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_y_continuous(labels = percent, limits = c(0, NA)) +
+  labs(title = "Monthly Cancellation Rate by Hotel Type",
+       x = "Arrival Month", y = "Cancellation Rate", color = "Hotel") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p_cancel
+ggsave("cancel_rate_monthly.png", p_cancel, width = 8, height = 5, dpi = 150)
+```
+
+Ümumi ləğv nisbəti City Hotel-də 41.7%, Resort Hotel-də 27.8%-dir. City il boyu 37-46% aralığında sabitdir, Resort isə mövsümidir: Yanvarda 14.8%, Avqustda 33.4%.
+
+## Lead time: ləğv edilmiş vs edilməmiş
+
+```{r lead-time}
+# Ləğv statusuna görə lead_time
+df %>%
+  group_by(is_canceled) %>%
+  summarise(n = n(),
+            mean_lead = mean(lead_time),
+            median_lead = median(lead_time))
+
+# Hotel üzrə orta lead_time
+df %>%
+  group_by(hotel) %>%
+  summarise(mean_lead = mean(lead_time))
+
+# Boxplot
+p_lead <- ggplot(df, aes(x = factor(is_canceled, labels = c("Not canceled", "Canceled")),
+                         y = lead_time, fill = factor(is_canceled))) +
+  geom_boxplot(show.legend = FALSE, outlier.alpha = 0.2) +
+  facet_wrap(~ hotel) +
+  labs(title = "Lead Time: Canceled vs Not Canceled",
+       x = NULL, y = "Lead time (days)") +
+  theme_minimal()
+
+p_lead
+ggsave("leadtime_boxplot.png", p_lead, width = 8, height = 5, dpi = 150)
+```
+
+Ləğv edilən rezervasiyalar orta hesabla 144.8 gün öncədən, edilməyənlər isə 80.0 gün öncədən edilib (median 113 vs 45), yəni fərq ekstremal dəyərlərdən yaranmayıb. Hotel üzrə orta lead_time City-də 109.7, Resort-da 92.7 gündür.
+
+## Top 10 ölkə və ləğv nisbəti
+
+```{r top10-countries}
+# Ölkələr üzrə rezervasiya sayı və ləğv nisbəti
+country_stats <- df %>%
+  group_by(country) %>%
+  summarise(bookings = n(),
+            cancelled = sum(is_canceled),
+            cancel_rate = mean(is_canceled),
+            .groups = "drop") %>%
+  arrange(desc(bookings))
+
+top10 <- country_stats %>% slice_head(n = 10)
+top10
+
+# Bar qrafiki: rəng ləğv nisbətini göstərir
+p_country <- ggplot(top10,
+                    aes(x = reorder(country, bookings), y = bookings,
+                        fill = cancel_rate)) +
+  geom_col() +
+  geom_text(aes(label = paste0(comma(bookings), " (",
+                               round(cancel_rate * 100, 1), "%)")),
+            hjust = -0.05, size = 3.5) +
+  coord_flip() +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.25))) +
+  scale_fill_gradient(low = "#fdd0a2", high = "#d94801", labels = percent) +
+  labs(title = "Top 10 Countries by Bookings",
+       subtitle = "Label: bookings (cancellation rate)",
+       x = "Country", y = "Bookings", fill = "Cancel rate") +
+  theme_minimal()
+
+p_country
+ggsave("top10_countries.png", p_country, width = 8, height = 5, dpi = 150)
+```
+
+Portekiz (PRT) 48,590 rezervasiya ilə birincidir və ləğv nisbəti 56.6%-dir. Digər top ölkələrdə bu göstərici 16.7% (DEU) ilə 37.3% (BRA) arasındadır, top 10 ölkə isə bütün rezervasiyaların təxminən 84%-ni təşkil edir.
+
+## Market segment analizi
+
+```{r market-segment}
+# 1) Segment üzrə tələbat və ləğv
+segment_stats <- df %>%
+  group_by(market_segment) %>%
+  summarise(bookings = n(),
+            cancelled = sum(is_canceled),
+            cancel_rate = mean(is_canceled),
+            .groups = "drop") %>%
+  mutate(share = bookings / sum(bookings)) %>%
+  arrange(desc(bookings))
+
+segment_stats %>%
+  mutate(share = round(share * 100, 1),
+         cancel_rate = round(cancel_rate * 100, 1))
+
+# 2) Pie chart (rezervasiya payı); 2%-dən kiçik dilimlərin yazısı gizlədilir
+pie_data <- segment_stats %>%
+  mutate(label = ifelse(share >= 0.02,
+                        paste0(market_segment, "\n", round(share * 100, 1), "%"),
+                        ""))
+
+p_pie <- ggplot(pie_data, aes(x = "", y = bookings, fill = market_segment)) +
+  geom_col(width = 1, color = "white") +
+  coord_polar(theta = "y") +
+  geom_text(aes(label = label),
+            position = position_stack(vjust = 0.5), size = 3.3) +
+  labs(title = "Bookings by Market Segment", fill = "Segment") +
+  theme_void()
+
+p_pie
+ggsave("market_segment_pie.png", p_pie, width = 7, height = 6, dpi = 150)
+
+# 3) Bonus: ən aşağı ləğv nisbətli segment (100-dən az rezervasiyalı segmentlər çıxarılır)
+segment_stats %>%
+  filter(bookings >= 100) %>%
+  arrange(cancel_rate) %>%
+  select(market_segment, bookings, cancel_rate)
+```
+
+Online TA rezervasiyaların 47.3%-ni təşkil edir, ən yüksək ləğv nisbəti isə Groups-dadır (61.1%). Bonus: cəmi 2 sətirlik `Undefined` çıxarılandan sonra ən aşağı ləğv nisbəti Complementary-dədir (13.1%, 743 rezervasiya), böyük həcmli segmentlər arasında isə Direct ən yaxşıdır (15.3%).
+
+## customer_type və deposit_type üzrə yoxlama
+
+```{r customer-deposit}
+# 1) customer_type üzrə pay və ləğv nisbəti
+df %>%
+  group_by(customer_type) %>%
+  summarise(bookings = n(),
+            cancel_rate = round(mean(is_canceled) * 100, 1),
+            .groups = "drop") %>%
+  mutate(share = round(bookings / sum(bookings) * 100, 1)) %>%
+  arrange(desc(bookings))
+
+# 2) deposit_type üzrə pay və ləğv nisbəti
+df %>%
+  group_by(deposit_type) %>%
+  summarise(bookings = n(),
+            cancel_rate = round(mean(is_canceled) * 100, 1),
+            .groups = "drop") %>%
+  mutate(share = round(bookings / sum(bookings) * 100, 1)) %>%
+  arrange(desc(bookings))
+
+# 3) Seçilmiş segmentlər × deposit_type: pay və ləğv nisbəti
+df %>%
+  filter(market_segment %in% c("Groups", "Online TA", "Direct")) %>%
+  group_by(market_segment, deposit_type) %>%
+  summarise(bookings = n(),
+            cancel_rate = round(mean(is_canceled) * 100, 1),
+            .groups = "drop") %>%
+  group_by(market_segment) %>%
+  mutate(share = round(bookings / sum(bookings) * 100, 1)) %>%
+  ungroup()
+
+# 4) PRT vs digər ölkələr × deposit_type: pay və ləğv nisbəti
+df %>%
+  mutate(is_prt = ifelse(country == "PRT", "PRT", "Other")) %>%
+  group_by(is_prt, deposit_type) %>%
+  summarise(bookings = n(),
+            cancel_rate = round(mean(is_canceled) * 100, 1),
+            .groups = "drop") %>%
+  group_by(is_prt) %>%
+  mutate(share = round(bookings / sum(bookings) * 100, 1)) %>%
+  ungroup()
+```
+
+"Transient" rezervasiyaların 75.1%-ni təşkil edir, bu `customer_type` göstəricisidir (`market_segment` deyil). Non Refund rezervasiyalarının 99.4%-i ləğv olunub, onların 97%-i Portekizdən gəlir və Groups seqmentinin 46.3%-i Non Refund-dur; No Deposit daxilində isə PRT-nin ləğv nisbəti (38.9%) digər ölkələrdən (23.2%) yüksək qalır.
+
+## ADR analizi (bonus): ay × hotel, dual-axis
+
+```{r adr-dual-axis}
+# adr üçün yoxlama: qeyri-adi dəyərlər
+summary(df$adr)
+sum(df$adr <= 0)     # sıfır və mənfi qiymətlər
+sum(df$adr >= 1000)  # ekstremal qiymətlər
+
+# Aylıq orta adr: yalnız ləğv edilməmiş rezervasiyalar, 0 < adr < 1000
+adr_monthly <- df %>%
+  filter(is_canceled == 0, adr > 0, adr < 1000) %>%
+  group_by(arrival_date_month, hotel) %>%
+  summarise(adr = mean(adr), .groups = "drop")
+
+adr_monthly %>%
+  mutate(adr = round(adr, 1)) %>%
+  pivot_wider(names_from = hotel, values_from = adr)
+
+# Dual-axis: xətt = adr (sol ox), bar = il başına orta rezervasiya (sağ ox)
+adr_avg <- adr_monthly %>%
+  left_join(monthly_avg %>% select(arrival_date_month, hotel, avg_bookings),
+            by = c("arrival_date_month", "hotel"))
+
+coef <- max(adr_avg$avg_bookings) / max(adr_avg$adr)
+
+p_adr <- ggplot(adr_avg, aes(x = arrival_date_month)) +
+  geom_col(aes(y = avg_bookings / coef), fill = "grey80") +
+  geom_line(aes(y = adr, group = 1), color = "#d94801", linewidth = 1) +
+  geom_point(aes(y = adr), color = "#d94801", size = 2) +
+  scale_y_continuous(name = "Average daily rate (adr)",
+                     sec.axis = sec_axis(~ . * coef,
+                                         name = "Avg bookings per year",
+                                         labels = comma)) +
+  facet_wrap(~ hotel) +
+  labs(title = "ADR vs Average Yearly Booking Volume by Month",
+       subtitle = "Line = ADR (left axis); bars = avg bookings per year (right axis)",
+       x = "Arrival Month") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p_adr
+ggsave("adr_dual_axis_normalized.png", p_adr, width = 10, height = 5, dpi = 150)
+```
+
+Resort Hotel-in ADR-i Yanvardakı 50.2-dən Avqustda 183.7-yə qalxır, halbuki rezervasiya sayı demək olar dəyişmir. City Hotel-in ADR-i 84-123 aralığındadır və May-da zirvəyə çatır. Hesablamada 1,960 sətir (`adr <= 0`) və 1 ekstremal dəyər (5,400) çıxarılıb.
+
+## Revenue management üçün 4 biznes insight
+
+**1. Resort-da mövsümilik həcmdə yox, qiymətdədir.** ADR 50-dən 184-ə qalxır, il başına orta rezervasiya isə Aprel-Oktyabr arası təxminən 1,500-1,800-də qalır. *Tövsiyə:* İyun-Sentyabrda dinamik qiymət tətbiq et, Yanvar və Noyabr-Dekabrda paket və aksiyalarla həcmi artır.
+
+**2. Uzun lead_time ləğv riskini artırır.** Ləğv edilənlər orta hesabla 145 gün, edilməyənlər 80 gün öncədən rezervasiya edilib. *Tövsiyə:* Overbooking buferini lead_time-a və otelə görə təyin et (City-də ləğv 41.7%), 100+ gün öncədən olan rezervasiyalarda yenidən təsdiq və ya qismən ödəniş sına.
+
+**3. Non Refund rezervasiyaları gözlənilməz davranır.** 14,587 rezervasiyanın (12.2%) 99.4%-i ləğv edilib və 97%-i Portekizdəndir; No Deposit daxilində belə PRT-nin ləğv nisbəti 38.9%-dir (digər ölkələrdə 23.2%). *Tövsiyə:* Non Refund-u ləğvdən qoruyucu hesab etmə, onu ayrıca proqnozlaşdır və bu qeydlərin datada necə yazıldığını data sahibi ilə dəqiqləşdir. Bu, hipotezdir, bu analiz səbəbi sübut etmir.
+
+**4. Kanal strukturu.** Direct (15.3%) və Corporate (18.7%) ən etibarlı kanallardır; Online TA həcmin 47.3%-ni verir (ləğv 36.7%). Groups-un 61.1%-lik ləğvi əsasən Non Refund qrup rezervasiyalarından gəlir (No Deposit-də 28.3%). *Tövsiyə:* Direct və Corporate kanalları gücləndir, qrup müqavilə şərtlərini yenidən nəzərdən keçir.
+
+## Məhdudiyyətlər
+
+- Data cəmi 26 ayı əhatə edir; 2015 qismən ildir və City Hotel üçün aşağı həcmlidir.
+- Ləğv nisbəti və ADR illər üzrə orta dəyərlərdir, illər arasında qiymət artımını gizlədə bilər.
+- Tapıntılar korrelyasiyadır, səbəb-nəticə sübutu deyil.
